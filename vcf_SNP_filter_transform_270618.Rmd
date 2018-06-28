@@ -1,0 +1,438 @@
+---
+title: "vcfR_SNP_filter"
+output: html_notebook
+---
+
+vcf file import, analysis, filtering, and genotype calling
+Phil Morin  3/22/18
+
+Modified June 27 to add options for re-calling genotypes based on minimum depth (minDP) and allelic ratio (AR), and exclude loci. (now in section 8-10)
+Subsequent sections were modified to use some replaced column names, but section 13 (to replace individual genotypes) has not been updated, so tgt5 is not yet made, and tgt4 should be used in subsequant sections.
+
+
+vcfR was designed to work on an individual chromosome, 
+supercontig or contig, depending on the state of your genome
+minor functions of plotting depth of coverage by samples and loci don't require the supercontig
+
+(1) ##################################################################
+Load packages and vcf file (can be gz compressed). Use description for output file names.
+```{r}
+rm(list = ls())
+library(vcfR)
+library(pinfsc50)
+library(reshape2)
+library(ggplot2)
+library(strataG)
+library(tidyverse)
+library(dplyr)
+library(easyGgplot2)
+library(gdata)
+
+description = "Ppho_trim2_largef_minCov10_minAlt5_fract0.3_SNP151_minDP10_noIndel_lowGeno"
+vcf <- read.vcfR("Ppho_340loc_trimmed2_largefiles_noMNP_noComplex_minCov10_minAlt5_fract0.3_SNP151_minDP10_noIndel_lowGeno.recode.vcf.gz")
+
+# test data
+#vcf <- read.vcfR("Ppho_340loc_trimmed2_largefiles_SNP151_minDP10_noIndel_lowGeno.test.vcf.gz")
+#description = "test"
+```
+
+(2) ##################################################################
+Extract depth for each locus/sample and reorganize data and render violin plots for depth by sample
+```{r}
+dp <- extract.gt(vcf, element='DP', as.numeric=TRUE)
+
+dpf <- melt(dp, varnames=c("Index", "Sample"), value.name = "Depth", na.rm=TRUE)
+
+dpf <- dpf[ dpf$Depth > 0,]
+
+p <- ggplot(dpf, aes(x=Sample, y=Depth)) +
+  geom_violin(fill="#C0C0C0", adjust=1.0, scale = "count", trim=TRUE)
+
+p <- p + theme_bw()
+p <- p + ylab("Read Depth (DP)")
+p <- p + theme(axis.title.x = element_blank(),
+               axis.text.x = element_text(angle = 90, hjust = 1))
+p <- p + stat_summary(fun.data=mean_sdl,
+                      geom="pointrange", color="black")
+p <- p + scale_y_continuous(trans=scales::log2_trans(), breaks=c(1, 10, 100, 1000))
+```
+
+Write violin plots to pdf (This is all loci, so it's too much for 1 plot; better if it could be subsetted
+into multiple plots of, say, 1/4 of the loci in each plot)
+```{r}
+pdf(paste(description, "_sample_depth", ".pdf",sep=""), width = 33, height = 8.5)
+p
+dev.off()
+```
+
+
+(3)  ##################################################################
+Plot as heatmap. Not very useful for large number of samples, so specified
+samples 1-20, including column (sample) labels and row (locus) labels
+cbarplot and rbarplot add summary bar plots for columns and rows (overall depth for samples, loci)
+```{r}
+pdf(paste(description, "_heatmap", ".pdf",sep=""), width = 8.5, height = 22)
+heatmap.bp(dp[1:10,1:10], clabels = TRUE, rlabels = TRUE, cbarplot = TRUE, Rbarplot = TRUE)
+dev.off()
+# dp[,1:10] limits output to first 10 samples; otherwise it's too big to print and see anything.
+# dp[1:10,1:10] limits output to first 10 samples, first 10 loci
+```
+
+
+(4) ##################################################################
+Check to see if loci ar polymorphic and if biallelic. Could be useful for checking if biallelic after filtering, e.g., removing minor alleles?
+```{r}
+polymorphic_loc<-is.polymorphic(vcf, na.omit = TRUE) # are loci polymorphic
+biallelic_loc<-is.biallelic(vcf) 
+sum(!biallelic_loc) # counts the number of "FALSE", where locus is not bi-allelic
+#biallelic_loc<-subset(multiallelic_loc,"FALSE") # it would be useful to create a dataframe of loci that are not biallelic
+```
+
+(5) ##################################################################
+Convert vcf to tidy dataframe
+the "gt_GT_alleles" column is always returned when any FORMAT fields are extracted
+#info <- extract_info_tidy(vcf, info_fields = NULL, info_types = TRUE, info_sep = ";")
+NS: Number of samples with data
+GT: genotype by allele order(?) (0, 1, 2, 3)
+AD: Total read depth for each allele
+GL: Genotype likelihoods
+AC: allele count in genotypes, for each ALT allele, in the same order as listed
+AN: total number of alleles in called genotypes
+DP: combined depth across samples, e.g. DP=154
+AO: Alternate allele observation count
+format_fields: names of the fields in the FORMAT column to be extracted from each individual in the vcfR object into a long format data frame. If left as NULL, the function will extract all the FORMAT columns that were documented in the meta section of the VCF file.
+Other info fields that could be included: 
+See https://en.wikipedia.org/wiki/Variant_Call_Format
+or https://samtools.github.io/hts-specs/VCFv4.3.pdf (page 9) for definitions.
+
+```{r}
+tidy_gt <- vcfR2tidy(vcf, 
+                    single_frame = TRUE, 
+                    info_fields = c("DP"), #"AS", "AD", "DP", "GQ", "AC", "AN", "PRO", "PAO", "AB", "DPRA", "ODDS", "MQM", "MQMR"
+                    format_fields = c("GT", "GL", "AD", "RO", "QR", "AO", "QA")) #"GQ", "AC", "DP", "MIN_DP"=NA
+
+# Eric Anderson's scripts to extract genotype matrix (4/13/18)
+# Separate gt_AO (alternate allele count) into multilple columns for each alternate allele present
+tgt2 <- tidy_gt$dat # from Eric Anderson's scripts to extract the genotype matrix, followed by separation of alleles.
+tgt3 <- separate(tgt2, col = gt_AO, into = c("A2", "A3", "A4"), sep = ",")
+tgt3$A2<-as.integer(tgt3$A2)
+tgt3$A3<-as.integer(tgt3$A3)
+tgt3$A4<-as.integer(tgt3$A4)
+```
+
+(6) ##################################################################
+
+Now, let’s make a data frame where rows are IDs and columns are genotypes. First, we will select just the columns that we are going to need, and then name the loci with the positions in there.
+```{r}
+tmp <- tgt2 %>%
+  select(Indiv, CHROM, POS, gt_GT_alleles) %>%
+  unite(chrompos, CHROM, POS, sep = "_")
+# then use spreading operation to convert to a matrix of samples by loci
+wide <- tmp %>%
+  spread(key = chrompos, value = gt_GT_alleles)
+# separate genotypes into 2 columns/locus
+gdata <- cbind(wide[, 1], alleleSplit(wide[, -1], sep = "/"))
+gdata <- as.data.frame(gdata)
+# look at a small part of that
+gdata[1:10, 1:10]
+# write csv file
+write.csv(gdata, paste(description, "_genotable.csv", sep = ""), row.names = FALSE)
+```
+
+(7) ##################################################################
+Now, let’s make a data frame where rows are IDs and columns are genotypes with allele counts. First, we will select just the columns that we are going to need, and then name the loci with the positions in there.
+```{r}
+tmp <- tgt2 %>%
+  select(Indiv, CHROM, POS, gt_GT_alleles, gt_RO, gt_AO) %>%
+  unite(chrompos, CHROM, POS, sep = "_") %>%
+  unite(gt_counts, gt_RO, gt_AO, sep = "/") %>%
+  unite(gtypes, gt_GT_alleles, gt_counts, sep = " ")
+# then use spreading operation to convert to a matrix of samples by loci
+wide <- tmp %>%
+  spread(key = chrompos, value = gtypes)
+# separate genotypes into 2 columns/locus
+#gdata <- cbind(wide[, 1], alleleSplit(wide[, -1], sep = "/"))
+
+gdata <- as.data.frame(wide)
+# look at a small part of that
+gdata[1:10, 1:10]
+# write csv file
+write.csv(gdata, paste(description, "_genocount.csv", sep = ""), row.names = FALSE)
+```
+
+(8) ##################################################################
+Plot the allele counts for reference (RO) and alternate (AO) allele for each locus?
+(this will not plot 3rd or 4th alleles, but will show the genotypes as different colors for genotypes that have a different allele (not ref or alt)
+```{r}
+# what do you want to call the saved pdf?
+pdfname = paste0(description, "_DP10_allele_multiplots.pdf")
+
+tmp2 <- tgt3 %>%
+  select(Indiv, CHROM, POS, gt_GT_alleles, gt_RO, A2) %>%  
+  unite(chrompos, CHROM, POS, sep = "_")
+
+loci<-unique(tmp2$chrompos)
+  # loctest<-c("Loc_2_151", "Loc_5_151", "Loc_6_151")
+  
+#extract data for each locus sequentially and plot
+pdf(pdfname) #
+  for(i in loci) {   #use loctest instead of loci to test before running on all loci
+chrompos <- i
+loc2plot<-as.data.frame(subset(tmp2, chrompos == i, select=c(Indiv, chrompos, gt_GT_alleles, gt_RO, A2)))
+loc2plot$A2<-as.numeric(loc2plot$A2)
+maxRO<-max(loc2plot$gt_RO, na.rm = TRUE)
+maxAO<-max(loc2plot$A2, na.rm = TRUE)
+range<-c(maxRO,maxAO)
+plot_limit<-(min(range)+100)
+
+# plot data
+o = ggplot(loc2plot, aes(x=A2, y=gt_RO, color=gt_GT_alleles)) + ggtitle(i) + geom_point() + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red") + geom_abline(slope = 0.4, intercept = 0, colour = "red")
+p = ggplot(loc2plot, aes(x=A2, y=gt_RO, color=gt_GT_alleles)) + ggtitle(i) + geom_point() + xlim(0, plot_limit) + ylim(0, plot_limit) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+q = ggplot(loc2plot, aes(x=A2, y=gt_RO, color=gt_GT_alleles)) + ggtitle(i) + geom_point() + xlim(0, 100) + ylim(0, 100) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red")+ geom_abline(slope = 0.4, intercept = 0, colour = "red")
+ggplot2.multiplot(o,p,q, cols=1)
+}
+dev.off()
+
+```
+
+(8-10) #################################################################
+Use multiplot figures to check each locus for errors in calls due to minimum depth, Allelic Ratio (AR), or uncallable (to be removed). Add notes to a spreadsheet so that all loci can be updated with new AR, new minDP, or excluded, and then new plots and tables exported.
+
+Once that's done, generate new .csv file containing columns for each locus for:
+  1) status (loci to Accept/Reject)
+  2) minDP (include default value and changed values (e.g., default = 10))
+  3) AR (include default value and changed values (e.g., default = 0.3))
+  column headings: locus, minDP, AR, status (#others OK, but only these are used)
+
+THIS MAY NEED TO BE DONE SEVERAL TIMES TO VERIFY THAT THE CHANGES ARE SUFFICIENT. Each time, the updated spreadsheet (or a new spreadsheet) can be used to modify the settings for all loci in tgt6.  
+```{r}
+# Remove loci first
+loc_ann <- read.csv("multiplot_loc_edit_130618.csv", header = TRUE)
+row.names(loc_ann) <- loc_ann$locus
+loc_ann$locus <- as.factor(loc_ann$locus)
+# need to change column name in data file from "CHROM" to "locus"
+tgt3$locus<-tgt3$CHROM # adds column "locus" with data from "CHROM"
+tgt3$CHROM<-NULL # deletes original "CHROM" column
+# add the status column to the dataframe based on locus name in both files
+tgt4 <- left_join(tgt3, loc_ann, "locus")
+# keep only rows for which the locus status is "Accept". 
+tgt4 <- tgt4[tgt4$status == "Accept", ]
+
+# Split genotype into separate alleles and reduce data to only relevant columns:
+tgt4 <- tgt4 %>% 
+  select(locus, POS, Indiv, gt_GT_alleles, depth.x=gt_RO, depth.y=A2, minDP, AR, status) %>%
+  separate(gt_GT_alleles, c("haplo.x", "haplo.y"), sep = "/", remove = TRUE)
+tgt4$depth.x<-as.numeric(tgt4$depth.x)
+tgt4$depth.y<-as.numeric(tgt4$depth.y)
+# Now change genotypes to NA if the combined read depth (depth.x + depth.y) is less than the minDP number for each locus
+xalleles<-ifelse(tgt4$depth.x + tgt4$depth.y < tgt4$minDP, NA, tgt4$haplo.x)
+yalleles<-ifelse(tgt4$depth.x + tgt4$depth.y < tgt4$minDP, NA, tgt4$haplo.y)
+#then replace alleles column with low-depth genotypes changed to blank
+tgt4$haplo.x<-xalleles
+tgt4$haplo.y<-yalleles
+
+# Then change genotype calls by AR
+lofreqy <- ifelse(tgt4$depth.y / tgt4$depth.x < tgt4$AR, tgt4$haplo.x, tgt4$haplo.y)
+lofreqx <- ifelse(tgt4$depth.x/tgt4$depth.y < tgt4$AR, tgt4$haplo.y, tgt4$haplo.x) 
+tgt4$haplo.y<-lofreqy
+tgt4$haplo.x<-lofreqx
+
+# Add actual AR to the dataframe and check that AR was applied
+tgt4$ARactual <- ifelse(tgt4$depth.x<tgt4$depth.y,tgt4$depth.x/tgt4$depth.y,tgt4$depth.y/tgt4$depth.x)
+# select a locus with a new AR, sort by ARactual, then look at the haplo.x and haplo.y alleles compared to 
+# the gt call for genotypes with ARactual just above and below the specified AR. Those below should be
+# homozygotes in the haplo columns (and previously het in the gt column if >0.3), and those above the 
+# specified AR will be hets.
+
+# Add a column with the called genotypes from combined alleles
+tgt4 <- unite(tgt4, gt, haplo.x, haplo.y, sep = "/", remove = FALSE)
+
+```
+
+
+
+(11) ##################################################################
+Now, make new allele plots for loci that were re-called based on the new minDP.
+The new plots is named with the minDP for the re-called loci, but all loci are included as in the first file for easier comparison.
+
+```{r}
+tmp3 <- tgt4 %>%
+  select(Indiv, locus, POS, gt, depth.x, depth.y) %>%  
+  unite(chrompos, locus, POS, sep = "_")
+
+loci<-unique(tmp3$chrompos)
+ #  loctest<-c("Loc_2_151", "Loc_5_151", "Loc_6_151")
+  
+#extract data for each locus sequentially and plot
+pdfname2<-paste0(description, "test_recalled_allele_multiplots.pdf") #  Change the name to reflect different minDP if needed
+
+pdf(pdfname2)
+  for(i in loctest) {   #use loctest instead of loci to test before running on all loci
+chrompos <- i
+loc2plot<-as.data.frame(subset(tmp3, chrompos == i, select=c(Indiv, chrompos, gt, depth.x, depth.y)))
+loc2plot$depth.y<-as.numeric(loc2plot$depth.y)
+maxRO<-max(loc2plot$depth.x, na.rm = TRUE)
+maxAO<-max(loc2plot$depth.y, na.rm = TRUE)
+range<-c(maxRO,maxAO)
+plot_limit<-(min(range)+100)
+
+# plot data
+o = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red") + geom_abline(slope = 0.4, intercept = 0, colour = "red")
+p = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + xlim(0, plot_limit) + ylim(0, plot_limit) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red") + geom_abline(slope = 0.4, intercept = 0, colour = "red")
+q = ggplot(loc2plot, aes(x=depth.y, y=depth.x, color=gt)) + ggtitle(i) + geom_point() + xlim(0, 100) + ylim(0, 100) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red") + geom_abline(slope = 0.4, intercept = 0, colour = "red")
+ggplot2.multiplot(o,p,q, cols=1)
+}
+dev.off()
+
+```
+ 
+ (12) ##################################################################
+Find and re-call or remove specific genotypes (see locus notes)
+ Make a data frame where rows are IDs and columns are genotypes with allele counts. First, we will select just the columns that we are going to need, and then name the loci with the positions in there.
+```{r}
+tmp <- tgt4 %>%
+  select(Indiv, locus, POS, gt, depth.x, depth.y) %>%
+  unite(loc_pos, locus, POS, sep = "_") %>%
+  unite(gt_counts, depth.x, depth.y, sep = "/") %>%
+  unite(gtypes, gt, gt_counts, sep = " ")
+# then use spreading operation to convert to a matrix of samples by loci
+wide <- tmp %>%
+  spread(key = loc_pos, value = gtypes)
+# separate genotypes into 2 columns/locus
+#gdata <- cbind(wide[, 1], alleleSplit(wide[, -1], sep = "/"))
+
+gdata <- as.data.frame(wide)
+# look at a small part of that
+gdata[1:10, 1:10]
+# write csv file
+write.csv(gdata, paste(description, "_minDP15_genocount.csv", sep = ""), row.names = FALSE)
+```
+ 
+
+(13) ##################################################################
+
+Remove individual sample genotypes (coded by Amy Van Cise)
+
+######This section needs to be updated if used, to substitute variable names:######
+old -> new
+CHROM -> locus
+gt_GT_alleles -> gt
+
+```{r}
+exclude_genotypes <- read.csv("genotype_changes_100518.csv", header = TRUE, stringsAsFactors=FALSE) # column headers include CHROM, Indiv, gt_GT_alleles (for new genotype). Replacement genotypes should be in same format (e.g., A/G), and excluded genotypes should be blank or NA. 
+
+# Combine CHROM and Indiv first:
+exclude_genotypes <- exclude_genotypes %>% unite(CHROM_Indiv, CHROM, Indiv, sep = "_")
+
+tgt5 <- tgt4 %>% unite(CHROM_Indiv, CHROM, Indiv, sep = "_", remove = FALSE) %>% 
+  merge(exclude_genotypes[,c(2,5)], by="CHROM_Indiv", all.x=TRUE) %>%
+  mutate(gt_GT_alleles = ifelse(CHROM_Indiv %in% exclude_genotypes$CHROM_Indiv, 
+                  gt_GT_alleles.y, gt_GT_alleles.x)) %>% 
+  select(-c(gt_GT_alleles.x,gt_GT_alleles.y))
+# clean up empty's (currently include "NA", "." and ""). Change all to NA
+tgt5$gt_GT_alleles <- ifelse(tgt5$gt_GT_alleles=="",NA,tgt5$gt_GT_alleles)
+tgt5$gt_GT_alleles <- ifelse(tgt5$gt_GT_alleles==".",NA,tgt5$gt_GT_alleles)
+
+# tgt5 should now have the corrected genotypes
+# Check to make sure genotypes were changed appropriately:
+
+changed_genotypes <- tgt5[which(tgt5$CHROM_Indiv %in% exclude_genotypes$CHROM_Indiv),c(1,length(tgt5))]
+write.csv(changed_genotypes, "changed_genotypes.csv")
+#That should give you a table with CHROM_Indiv and the genotype column for only the rows that were in exclude_genotypes, so that you can check to make sure that the right rows ended up in the right place.
+
+```
+
+(14) ##################################################################
+Transform into a dataframe for export
+```{r}
+# first, re-separate CHROM and Indiv:
+
+# Then make data frame (use tgt4 if individual genotype change section (13) was skipped)
+tmp <- tgt5 %>%
+  select(Indiv, locus, POS, gt) %>%
+  separate(Indiv, c("species", "id"), sep = "o") 
+tmp$species <- NULL
+#This is specific to my Ppho data, to delete the "Ppho" at the begining of the sample ID's.
+tmp4 <- tmp %>%
+  unite(loc_pos, locus, POS, sep = "_")
+
+
+# then use spreading operation to convert to a matrix of samples by loci
+wide <- tmp4 %>%
+  spread(key = loc_pos, value = gt)
+# separate genotypes into 2 columns/locus
+gdata <- cbind(wide[, 1], alleleSplit(wide[, -1], sep = "/"))
+gdata <- as.data.frame(gdata)
+# look at a small part of that
+gdata[1:10, 1:10]
+# write csv file
+write.csv(gdata, paste(description, "_final_genotable.csv", sep = ""), row.names = FALSE)
+
+```
+
+
+(15) ##################################################################
+Re-plot final dataset for records (optional)
+```{r}
+tmp3 <- tgt5 %>%
+  select(Indiv, locus, POS, gt, depth.x, depth.y) %>%  
+  unite(loc_pos, locus, POS, sep = "_") 
+
+loci<-unique(tmp3$loc_pos)
+ #  loctest<-c("Loc_2_151", "Loc_5_151", "Loc_6_151")
+  
+#extract data for each locus sequentially and plot
+pdfname2<-paste0(description, "_FINAL_allele_multiplots.pdf") #  Change the name to reflect different minDP if needed
+
+pdf(pdfname2)
+  for(i in loci) {   #use loctest instead of loci to test before running on all loci
+chrompos <- i
+loc2plot<-as.data.frame(subset(tmp3, loc_pos == i, select=c(Indiv, chrompos, gt, depth.x, depth.y)))
+loc2plot$depth.y<-as.numeric(loc2plot$depth.y)
+maxRO<-max(loc2plot$depth.x, na.rm = TRUE)
+maxAO<-max(loc2plot$depth.y, na.rm = TRUE)
+range<-c(maxRO,maxAO)
+plot_limit<-(min(range)+100)
+
+# plot data
+o = ggplot(loc2plot, aes(x=depth.y, y=depth.y, color=gt)) + ggtitle(i) + geom_point() + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red") + geom_abline(slope = 0.4, intercept = 0, colour = "red")
+p = ggplot(loc2plot, aes(x=depth.y, y=depth.y, color=g)) + ggtitle(i) + geom_point() + xlim(0, plot_limit) + ylim(0, plot_limit) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red") + geom_abline(slope = 0.4, intercept = 0, colour = "red")
+q = ggplot(loc2plot, aes(x=depth.y, y=depth.y, color=g)) + ggtitle(i) + geom_point() + xlim(0, 100) + ylim(0, 100) + geom_abline(slope = 3.33, intercept = 0, colour = "blue") + geom_abline(slope = 0.33, intercept = 0, colour = "blue")+ geom_abline(slope = 2.5, intercept = 0, colour = "red") + geom_abline(slope = 0.4, intercept = 0, colour = "red")
+ggplot2.multiplot(o,p,q, cols=1)
+}
+dev.off()
+
+```
+
+(16) ##################################################################
+convert full data set to reduced column dataframe for import to database (1 row per genotype).
+```{r}
+# Then make data frame of reduced columns, and remove "Ppho" from beginning of sample IDs (to leave just LABIDs)
+tmp6 <- tgt5 %>%
+  select(Indiv, locus, POS, gt, depth.x, depth.y) %>%
+  separate(Indiv, c("species", "id"), sep = "o")
+tmp6$species <- NULL  #This is specific to my Ppho data, to delete the "Ppho" at the begining of the sample ID's.
+write.csv(tmp6, paste0(description, "_final_genotype_data_for_DB.csv"), row.names = FALSE)
+# saving the data this way gets around issue in Access of allowing only ~250 columns. Data will need to be converted to a matrix of samples by loci (and split columns for alleles) either using a cross-tab table in Access or an R script (e.g., #14 above). 
+```
+
+ 
+ 
+ 
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
